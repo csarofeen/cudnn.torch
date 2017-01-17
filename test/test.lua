@@ -1,7 +1,8 @@
 require 'cudnn'
 require 'cunn'
 
-
+cudnn.configureMath({ ['torch.CudaHalfTensor']   = 'CUDNN_DATA_FLOAT'} )
+cudnn.keep32bitParam = true
 local cudnntest = torch.TestSuite()
 local times = {}
 local mytester
@@ -814,7 +815,7 @@ function cudnntest.functional_bias2D()
    mod.weight:zero()
    local groundtruth = mod:forward(input)
    local result = groundtruth:clone():zero()
-   cudnn.functional.bias2D_updateOutput(cudnn.getHandle(), mod.bias, result)
+   cudnn.functional.bias2D_updateOutput(cudnn.getHandle(), cast(mod.bias), result)
    local error = result:float() - groundtruth:float()
    mytester:assertlt(error:abs():max(),
                      testparams.precision_forward, 'error on forward ')
@@ -822,7 +823,7 @@ function cudnntest.functional_bias2D()
    mod:zeroGradParameters()
    local gradOutput = cast(groundtruth:clone():double():normal())
    mod:backward(input, gradOutput, scale)
-   local groundtruth = mod.gradBias
+   local groundtruth = cast(mod.gradBias)
    local result = groundtruth:clone():zero()
    cudnn.functional.bias2D_accGradParameters(cudnn.getHandle(), gradOutput, result, scale)
    error = result:float() - groundtruth:float()
@@ -841,13 +842,13 @@ function cudnntest.functional_convolution2d()
     local gradInput = cast(a:backward(input, gradOutput):clone():double():normal())
     local gradWeight = cast(a.gradWeight:clone():zero())
     cudnn.functional.Convolution2D_updateOutput(cudnn.getHandle(), input,
-                                                a.weight, output, a.dH,
+                                                cast(a.weight), output, a.dH,
                                                 a.dW, a.padH, a.padW)
     mytester:assertlt((output - a.output):abs():max(),
                      testparams.precision_forward, 'error on forward ')
 
     cudnn.functional.Convolution2D_updateGradInput(cudnn.getHandle(), input,
-                                                   a.weight, output, gradOutput,
+                                                   cast(a.weight), output, gradOutput,
                                                    gradInput,
                                                    a.dH, a.dW, a.padH, a.padW)
     mytester:assertlt((gradInput - a.gradInput):abs():max(),
@@ -856,7 +857,7 @@ function cudnntest.functional_convolution2d()
     cudnn.functional.Convolution2D_accGradParameters(cudnn.getHandle(), input,
                                                    gradWeight, gradOutput,
                                                    a.dH, a.dW, a.padH, a.padW)
-    mytester:assertlt((gradWeight - a.gradWeight):abs():max(),
+    mytester:assertlt((gradWeight - cast(a.gradWeight)):abs():max(),
                      testparams.precision_forward, 'error on accGradParameters ')
 end
 

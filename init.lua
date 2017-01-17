@@ -14,6 +14,7 @@ if ffi.os == "Windows" then thc = ffi.load("THC") end
 
 cudnn.benchmark = false
 cudnn.fastest = false
+cudnn.keep32bitParam = false
 
 -- use new cudnn FindEx APIs
 -- Warning: this option is experimental and assumes at least 2 warmup iterations!

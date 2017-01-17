@@ -34,15 +34,21 @@ function SpatialConvolution:resetWeightDescriptors(desc)
 
     -- create descriptor for bias
     if self.bias then
-        self.biasDesc = cudnn.toDescriptor(self.bias:view(1, self.nOutputPlane,1,1))
+       local bias = self.bias
+       if(self.bias_16b) then bias = self.bias_16b end
+       self.biasDesc = cudnn.toDescriptor(bias:view(1, self.nOutputPlane,1,1))
     end
 
+    local weight =self.weight
+    if self.weight_16b then weight = self.weight_16b end
+    
     self.weightDesc = cudnn.setFilterDescriptor(
-       { dataType = cudnn.typemap[torch.typename(self.weight)],
-         filterDimA = desc or
-            {self.nOutputPlane/self.groups,
-             self.nInputPlane/self.groups,
-             self.kH, self.kW}
+       {
+	  dataType = cudnn.typemap[torch.typename(weight)],
+	  filterDimA = desc or
+	     {self.nOutputPlane/self.groups,
+	      self.nInputPlane/self.groups,
+	      self.kH, self.kW}
        }
     )
 
@@ -189,12 +195,19 @@ function SpatialConvolution:updateOutput(input)
     local finder = find.get()
     local fwdAlgo = finder:forwardAlgorithm(self, { self.iDesc[0], self.input_slice, self.weightDesc[0],
                                                     self.weight, self.convDesc[0], self.oDesc[0], self.output_slice})
+
+    local weight = self.weight
+    if self.weight_16b then
+       self.weight_16b:copy(self.weight)
+       weight = self.weight_16b
+    end
+    
     local extraBuffer, extraBufferSize = cudnn.getSharedWorkspace()
     for g = 0, self.groups - 1 do
         checkedCall(self,'cudnnConvolutionForward', cudnn.getHandle(),
                     cudnn.scalar(input, 1),
                     self.iDesc[0], input:data() + g*self.input_offset,
-                    self.weightDesc[0], self.weight:data() + g*self.weight_offset,
+                    self.weightDesc[0], weight:data() + g*self.weight_offset,
                     self.convDesc[0], fwdAlgo,
                     extraBuffer, extraBufferSize,
                     cudnn.scalar(input, 0),
@@ -203,8 +216,13 @@ function SpatialConvolution:updateOutput(input)
 
     -- add bias
     if self.bias then
+       local bias = self.bias
+       if(self.bias_16b) then
+	  bias = self.bias_16b
+	  bias:copy(self.bias)
+       end
         errcheck('cudnnAddTensor', cudnn.getHandle(),
-                 cudnn.scalar(input, 1), self.biasDesc[0], self.bias:data(),
+                 cudnn.scalar(input, 1), self.biasDesc[0], bias:data(),
                  cudnn.scalar(input, 1), self.oDescForBias[0], self.output:data())
     end
 
@@ -221,11 +239,18 @@ function SpatialConvolution:updateGradInput(input, gradOutput)
     local finder = find.get()
     local bwdDataAlgo = finder:backwardDataAlgorithm(self, { self.weightDesc[0], self.weight, self.oDesc[0],
                                                              self.output_slice, self.convDesc[0], self.iDesc[0], self.input_slice })
+
+    local weight = self.weight
+    if self.weight_16b then
+       self.weight_16b:copy(self.weight)
+       weight = self.weight_16b
+    end
+    
     local extraBuffer, extraBufferSize = cudnn.getSharedWorkspace()
     for g = 0,self.groups - 1 do
         checkedCall(self,'cudnnConvolutionBackwardData', cudnn.getHandle(),
                     cudnn.scalar(input, 1),
-                    self.weightDesc[0], self.weight:data() + g*self.weight_offset,
+                    self.weightDesc[0], weight:data() + g*self.weight_offset,
                     self.oDesc[0], gradOutput:data() + g*self.output_offset,
                     self.convDesc[0],
                     bwdDataAlgo,
@@ -246,18 +271,36 @@ function SpatialConvolution:accGradParameters(input, gradOutput, scale)
     input, gradOutput = makeContiguous(self, input, gradOutput)
     self:createIODescriptors(input)
     local finder = find.get()
+    local weight
+    if self.weight_16b then
+       weight = self.weight_16b
+    end
+
     local bwdFilterAlgo = finder:backwardFilterAlgorithm(self, { self.iDesc[0], self.input_slice, self.oDesc[0],
-                                                               self.output_slice, self.convDesc[0], self.weightDesc[0], self.weight})
+								 self.output_slice, self.convDesc[0], self.weightDesc[0], weight})
 
     -- gradBias
     if self.bias then
-        errcheck('cudnnConvolutionBackwardBias', cudnn.getHandle(),
-                 self.scaleT:data(),
-                 self.oDescForBias[0], gradOutput:data(),
-                 cudnn.scalar(input, 1),
-                 self.biasDesc[0], self.gradBias:data())
+       local gbias = self.gradBias
+       if self.weight_16b then
+	  gbias = self.gradBias_16b
+	  self.gradBias_16b:copy(self.gradBias)
+       end
+       errcheck('cudnnConvolutionBackwardBias', cudnn.getHandle(),
+		self.scaleT:data(),
+		self.oDescForBias[0], gradOutput:data(),
+		cudnn.scalar(input, 1),
+		self.biasDesc[0], gbias:data())
+       if self.weight_16b then
+	  self.gradBias:copy(self.gradBias_16b)
+       end
     end
-
+    local gweight = self.gradWeight
+    if self.weight_16b then
+       gweight = self.gradWeight_16b
+       gweight:copy(self.gradWeight)
+    end
+    
     local extraBuffer, extraBufferSize = cudnn.getSharedWorkspace()
     for g = 0, self.groups - 1 do
         -- gradWeight
@@ -269,10 +312,40 @@ function SpatialConvolution:accGradParameters(input, gradOutput, scale)
                    bwdFilterAlgo,
                    extraBuffer, extraBufferSize,
                    cudnn.scalar(input, 1),
-                   self.weightDesc[0], self.gradWeight:data() + g*self.weight_offset);
+                   self.weightDesc[0], gweight:data() + g*self.weight_offset);
     end
-
+    if self.weight_16b then
+       self.gradWeight:copy(self.gradWeight_16b)
+    end
+    
     return self.gradOutput
+end
+
+function SpatialConvolution:type(type, tensorCache)
+
+   if cudnn.keep32bitParam then
+      local _type = type == 'torch.CudaHalfTensor' and 'torch.CudaTensor' or type
+      parent.type(self, _type, tensorCache)
+      if type == 'torch.CudaHalfTensor' then
+	 self.weight_16b = torch.CudaHalfTensor(self.weight:size())
+	 if self.bias then
+	    self.bias_16b = torch.CudaHalfTensor(self.bias:size())
+	    self.gradBias_16b = torch.CudaHalfTensor(self.gradBias:size())
+	 end
+	 self.gradWeight_16b = torch.CudaHalfTensor(self.gradWeight:size())
+      else
+	 if self.weight_16b then
+	    nn.utils.clear('weight_16b', 'gradWeight_16b', 'bias_16b', 'gradBias_16b')
+	 end
+      end
+      self.output = self.output:type(type)
+      if self.gradInput then
+	 self.gradInput = self.gradInput:type(type)
+      end
+      return self
+   end
+   parent.type(self, type, tensorCache)
+   return self
 end
 
 function SpatialConvolution:clearDesc()
